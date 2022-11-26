@@ -3,6 +3,7 @@
 #include "obs-frontend-api.h"
 #include "obs-module.h"
 #include "obs.h"
+#include <util/threading.h>
 #include "version.h"
 #include "util/circlebuf.h"
 
@@ -14,6 +15,7 @@ struct audio_monitor_context {
 	obs_source_t *source;
 	struct audio_monitor *monitor;
 	long long delay;
+	pthread_mutex_t audio_buffer_mutex;
 	struct circlebuf audio_buffer;
 	bool linked;
 	bool updating_volume;
@@ -312,6 +314,7 @@ static void *audio_monitor_filter_create(obs_data_t *settings,
 	struct audio_monitor_context *audio_monitor =
 		bzalloc(sizeof(struct audio_monitor_context));
 	audio_monitor->source = source;
+	pthread_mutex_init(&audio_monitor->audio_buffer_mutex, NULL);
 	signal_handler_add(obs_source_get_signal_handler(source),
 			   "void updated(ptr source)");
 	audio_monitor_update(audio_monitor, settings);
@@ -337,6 +340,7 @@ static void audio_monitor_filter_destroy(void *data)
 	}
 	audio_monitor->source = NULL;
 	audio_monitor_destroy(audio_monitor->monitor);
+	pthread_mutex_destroy(&audio_monitor->audio_buffer_mutex);
 	while (audio_monitor->audio_buffer.size) {
 		struct obs_audio_data cached;
 		circlebuf_pop_front(&audio_monitor->audio_buffer, &cached,
@@ -352,50 +356,18 @@ struct obs_audio_data *audio_monitor_filter_audio(void *data,
 						  struct obs_audio_data *audio)
 {
 	struct audio_monitor_context *audio_monitor = data;
-	if (audio_monitor->delay) {
-		struct obs_audio_data cached = *audio;
-		for (size_t i = 0; i < MAX_AV_PLANES; i++) {
-			if (!audio->data[i])
-				break;
+	struct obs_audio_data cached = *audio;
+	for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+		if (!audio->data[i])
+			break;
 
-			cached.data[i] = bmemdup(audio->data[i],
-						 audio->frames * sizeof(float));
-		}
-		circlebuf_push_back(&audio_monitor->audio_buffer, &cached,
-				    sizeof(cached));
-		circlebuf_peek_front(&audio_monitor->audio_buffer, &cached,
-				     sizeof(cached));
-		uint64_t diff = cached.timestamp > audio->timestamp
-					? cached.timestamp - audio->timestamp
-					: audio->timestamp - cached.timestamp;
-		while (audio_monitor->audio_buffer.size > sizeof(cached) &&
-		       diff >= (uint64_t)audio_monitor->delay * 1000000) {
-
-			circlebuf_pop_front(&audio_monitor->audio_buffer, NULL,
-					    sizeof(cached));
-
-			audio_monitor_audio(audio_monitor->monitor, &cached);
-
-			for (size_t i = 0; i < MAX_AV_PLANES; i++)
-				bfree(cached.data[i]);
-
-			circlebuf_peek_front(&audio_monitor->audio_buffer,
-					     &cached, sizeof(cached));
-			diff = cached.timestamp > audio->timestamp
-				       ? cached.timestamp - audio->timestamp
-				       : audio->timestamp - cached.timestamp;
-		}
-	} else {
-		if (audio_monitor->monitor)
-			audio_monitor_audio(audio_monitor->monitor, audio);
-		while (audio_monitor->audio_buffer.size) {
-			struct obs_audio_data cached;
-			circlebuf_pop_front(&audio_monitor->audio_buffer,
-					    &cached, sizeof(cached));
-			for (size_t i = 0; i < MAX_AV_PLANES; i++)
-				bfree(cached.data[i]);
-		}
+		cached.data[i] =
+			bmemdup(audio->data[i], audio->frames * sizeof(float));
 	}
+	pthread_mutex_lock(&audio_monitor->audio_buffer_mutex);
+	circlebuf_push_back(&audio_monitor->audio_buffer, &cached,
+			    sizeof(cached));
+	pthread_mutex_unlock(&audio_monitor->audio_buffer_mutex);
 	return audio;
 }
 
@@ -555,6 +527,44 @@ void audio_monitor_defaults(obs_data_t *settings)
 		audio_output_get_info(obs_get_audio())->samples_per_sec);
 }
 
+void audio_monitor_filter_tick(void *data, float seconds)
+{
+	struct audio_monitor_context *audio_monitor = data;
+	pthread_mutex_lock(&audio_monitor->audio_buffer_mutex);
+	if (!audio_monitor->audio_buffer.size) {
+		pthread_mutex_unlock(&audio_monitor->audio_buffer_mutex);
+		return;
+	}
+	struct obs_audio_data cached;
+	circlebuf_peek_front(&audio_monitor->audio_buffer, &cached,
+			     sizeof(cached));
+	struct obs_audio_data last;
+	circlebuf_peek_back(&audio_monitor->audio_buffer, &last, sizeof(last));
+	uint64_t diff = cached.timestamp > last.timestamp
+				? cached.timestamp - last.timestamp
+				: last.timestamp - cached.timestamp;
+	while (audio_monitor->audio_buffer.size > sizeof(cached) &&
+	       diff >= (uint64_t)audio_monitor->delay * 1000000) {
+
+		circlebuf_pop_front(&audio_monitor->audio_buffer, NULL,
+				    sizeof(cached));
+		pthread_mutex_unlock(&audio_monitor->audio_buffer_mutex);
+		audio_monitor_audio(audio_monitor->monitor, &cached);
+
+		for (size_t i = 0; i < MAX_AV_PLANES; i++)
+			bfree(cached.data[i]);
+
+		pthread_mutex_lock(&audio_monitor->audio_buffer_mutex);
+		circlebuf_peek_front(&audio_monitor->audio_buffer, &cached,
+				     sizeof(cached));
+		circlebuf_peek_back(&audio_monitor->audio_buffer, &last, sizeof(last));
+		diff = cached.timestamp > last.timestamp
+			       ? cached.timestamp - last.timestamp
+			       : last.timestamp - cached.timestamp;
+	}
+	pthread_mutex_unlock(&audio_monitor->audio_buffer_mutex);
+}
+
 struct obs_source_info audio_monitor_filter_info = {
 	.id = "audio_monitor",
 	.type = OBS_SOURCE_TYPE_FILTER,
@@ -567,6 +577,7 @@ struct obs_source_info audio_monitor_filter_info = {
 	.get_defaults = audio_monitor_defaults,
 	.get_properties = audio_monitor_properties,
 	.filter_audio = audio_monitor_filter_audio,
+	.video_tick = audio_monitor_filter_tick,
 };
 
 OBS_DECLARE_MODULE()

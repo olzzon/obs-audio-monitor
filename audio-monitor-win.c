@@ -34,7 +34,7 @@ struct audio_monitor {
 	uint32_t channels;
 	audio_resampler_t *resampler;
 	float volume;
-	pthread_mutex_t mutex;
+	pthread_rwlock_t rwlock;
 	char *device_id;
 	char *source_name;
 	SOCKET sock;
@@ -68,7 +68,7 @@ void audio_monitor_stop(struct audio_monitor *audio_monitor)
 	if (!audio_monitor)
 		return;
 
-	pthread_mutex_lock(&audio_monitor->mutex);
+	pthread_rwlock_wrlock(&audio_monitor->rwlock);
 
 	if (audio_monitor->client)
 		audio_monitor->client->lpVtbl->Stop(audio_monitor->client);
@@ -81,7 +81,7 @@ void audio_monitor_stop(struct audio_monitor *audio_monitor)
 	audio_monitor->render = NULL;
 	audio_resampler_destroy(audio_monitor->resampler);
 	audio_monitor->resampler = NULL;
-	pthread_mutex_unlock(&audio_monitor->mutex);
+	pthread_rwlock_unlock(&audio_monitor->rwlock);
 }
 
 void audio_monitor_start(struct audio_monitor *audio_monitor)
@@ -89,7 +89,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 	if (!audio_monitor)
 		return;
 
-	pthread_mutex_lock(&audio_monitor->mutex);
+	pthread_rwlock_wrlock(&audio_monitor->rwlock);
 	const struct audio_output_info *info =
 		audio_output_get_info(obs_get_audio());
 	struct resample_info to;
@@ -104,7 +104,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 					      &IID_IMMDeviceEnumerator,
 					      (void **)&immde);
 		if (FAILED(hr)) {
-			pthread_mutex_unlock(&audio_monitor->mutex);
+			pthread_rwlock_unlock(&audio_monitor->rwlock);
 			return;
 		}
 		if (strcmp(audio_monitor->device_id, "default") == 0) {
@@ -120,7 +120,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 		}
 		if (FAILED(hr)) {
 			safe_release(immde);
-			pthread_mutex_unlock(&audio_monitor->mutex);
+			pthread_rwlock_unlock(&audio_monitor->rwlock);
 			return;
 		}
 		hr = audio_monitor->device->lpVtbl->Activate(
@@ -128,7 +128,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 			NULL, (void **)&audio_monitor->client);
 		if (FAILED(hr)) {
 			safe_release(immde);
-			pthread_mutex_unlock(&audio_monitor->mutex);
+			pthread_rwlock_unlock(&audio_monitor->rwlock);
 			return;
 		}
 		WAVEFORMATEX *wfex = NULL;
@@ -136,7 +136,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 			audio_monitor->client, &wfex);
 		if (FAILED(hr)) {
 			safe_release(immde);
-			pthread_mutex_unlock(&audio_monitor->mutex);
+			pthread_rwlock_unlock(&audio_monitor->rwlock);
 			return;
 		}
 		hr = audio_monitor->client->lpVtbl->Initialize(
@@ -145,7 +145,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 		if (FAILED(hr)) {
 			safe_release(immde);
 			CoTaskMemFree(wfex);
-			pthread_mutex_unlock(&audio_monitor->mutex);
+			pthread_rwlock_unlock(&audio_monitor->rwlock);
 			return;
 		}
 		WAVEFORMATEXTENSIBLE *ext = (WAVEFORMATEXTENSIBLE *)wfex;
@@ -163,7 +163,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 			audio_monitor->client, &frames);
 		if (FAILED(hr)) {
 			safe_release(immde);
-			pthread_mutex_unlock(&audio_monitor->mutex);
+			pthread_rwlock_unlock(&audio_monitor->rwlock);
 			return;
 		}
 		hr = audio_monitor->client->lpVtbl->GetService(
@@ -171,7 +171,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 			(void **)&audio_monitor->render);
 		if (FAILED(hr)) {
 			safe_release(immde);
-			pthread_mutex_unlock(&audio_monitor->mutex);
+			pthread_rwlock_unlock(&audio_monitor->rwlock);
 			return;
 		}
 		hr = audio_monitor->client->lpVtbl->Start(
@@ -233,19 +233,25 @@ void audio_monitor_start(struct audio_monitor *audio_monitor)
 	}
 
 	audio_monitor->resampler = audio_resampler_create(&to, &from);
-	pthread_mutex_unlock(&audio_monitor->mutex);
+	pthread_rwlock_unlock(&audio_monitor->rwlock);
 }
 
 void audio_monitor_audio(void *data, struct obs_audio_data *audio)
 {
 	struct audio_monitor *audio_monitor = data;
+	if(pthread_rwlock_tryrdlock(&audio_monitor->rwlock) != 0)
+		return;
 	if (!audio_monitor->resampler && audio_monitor->device_id &&
 	    strlen(audio_monitor->device_id)) {
+		pthread_rwlock_unlock(&audio_monitor->rwlock);
 		audio_monitor_start(audio_monitor);
+		if(pthread_rwlock_tryrdlock(&audio_monitor->rwlock) != 0)
+			return;
 	}
-	if (!audio_monitor->resampler ||
-	    pthread_mutex_trylock(&audio_monitor->mutex) != 0)
+	if (!audio_monitor->resampler){
+		pthread_rwlock_unlock(&audio_monitor->rwlock);
 		return;
+	}
 
 	uint8_t *resample_data[MAX_AV_PLANES];
 	uint32_t resample_frames;
@@ -255,7 +261,7 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio)
 		&ts_offset, (const uint8_t *const *)audio->data,
 		(uint32_t)audio->frames);
 	if (!success) {
-		pthread_mutex_unlock(&audio_monitor->mutex);
+		pthread_rwlock_unlock(&audio_monitor->rwlock);
 		return;
 	}
 	/* apply volume */
@@ -359,7 +365,7 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio)
 			bfree(msg);
 		}
 
-		pthread_mutex_unlock(&audio_monitor->mutex);
+		pthread_rwlock_unlock(&audio_monitor->rwlock);
 		return;
 	}
 
@@ -367,15 +373,17 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio)
 	HRESULT hr = audio_monitor->client->lpVtbl->GetCurrentPadding(
 		audio_monitor->client, &pad);
 	if (FAILED(hr)) {
-		pthread_mutex_unlock(&audio_monitor->mutex);
-		audio_monitor_stop(audio_monitor);
+		bool stop = audio_monitor->resampler != NULL;
+		pthread_rwlock_unlock(&audio_monitor->rwlock);
+		if(stop)
+			audio_monitor_stop(audio_monitor);
 		return;
 	}
 	BYTE *output;
 	hr = audio_monitor->render->lpVtbl->GetBuffer(audio_monitor->render,
 						      resample_frames, &output);
 	if (FAILED(hr)) {
-		pthread_mutex_unlock(&audio_monitor->mutex);
+		pthread_rwlock_unlock(&audio_monitor->rwlock);
 		audio_monitor_stop(audio_monitor);
 		return;
 	}
@@ -384,7 +392,7 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio)
 	       resample_frames * audio_monitor->channels * sizeof(float));
 	audio_monitor->render->lpVtbl->ReleaseBuffer(audio_monitor->render,
 						     resample_frames, 0);
-	pthread_mutex_unlock(&audio_monitor->mutex);
+	pthread_rwlock_unlock(&audio_monitor->rwlock);
 }
 
 void audio_monitor_set_volume(struct audio_monitor *audio_monitor, float volume)
@@ -422,7 +430,7 @@ struct audio_monitor *audio_monitor_create(const char *device_id,
 	audio_monitor->source_name = bstrdup(source_name);
 	audio_monitor->volume = 1.0f;
 	audio_monitor->format = AUDIO_FORMAT_FLOAT;
-	pthread_mutex_init(&audio_monitor->mutex, NULL);
+	pthread_rwlock_init(&audio_monitor->rwlock, NULL);
 	if (port) {
 		char buffer[10];
 		snprintf(buffer, 10, "%d", port);
@@ -440,6 +448,7 @@ void audio_monitor_destroy(struct audio_monitor *audio_monitor)
 	audio_monitor_stop(audio_monitor);
 	if (audio_monitor->sock)
 		closesocket(audio_monitor->sock);
+	pthread_rwlock_destroy(&audio_monitor->rwlock);
 	bfree(audio_monitor->source_name);
 	bfree(audio_monitor->device_id);
 	bfree(audio_monitor);
