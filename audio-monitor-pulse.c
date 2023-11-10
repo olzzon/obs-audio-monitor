@@ -482,6 +482,9 @@ static void pulseaudio_underflow(pa_stream *p, void *userdata)
 }
 
 void audio_monitor_stop(struct audio_monitor *audio_monitor){
+	if (!audio_monitor)
+		return;
+
     if (audio_monitor->stream) {
         /* Stop the stream */
         pulseaudio_lock();
@@ -513,6 +516,9 @@ void audio_monitor_stop(struct audio_monitor *audio_monitor){
 }
 
 void audio_monitor_start(struct audio_monitor *audio_monitor){
+    if (!audio_monitor)
+		return;
+
     pulseaudio_init();
 	char *device = NULL;
 	if (strcmp(audio_monitor->device_id, "default") == 0) {
@@ -689,6 +695,8 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio){
 
 void audio_monitor_set_volume(struct audio_monitor *audio_monitor,
 			      float volume){
+    if (!audio_monitor)
+		return;
     audio_monitor->volume = volume;
 }
 
@@ -698,6 +706,8 @@ struct audio_monitor *audio_monitor_create(const char *device_id, const char *so
 		bzalloc(sizeof(struct audio_monitor));
 	audio_monitor->device_id = bstrdup(device_id);
 	audio_monitor->source_name = bstrdup(source_name);
+    audio_monitor->volume = 1.0f;
+	audio_monitor->format = AUDIO_FORMAT_FLOAT;
 	pthread_mutex_init(&audio_monitor->mutex, NULL);
 	return audio_monitor;
 }
@@ -712,5 +722,33 @@ void audio_monitor_destroy(struct audio_monitor *audio_monitor){
 }
 
 const char *audio_monitor_get_device_id(struct audio_monitor *audio_monitor){
+	if (!audio_monitor)
+		return NULL;
     return audio_monitor->device_id;
+}
+
+void audio_monitor_set_format(struct audio_monitor *audio_monitor,
+			      enum audio_format format)
+{
+	if (!format || audio_monitor->format == format ||
+	    format > AUDIO_FORMAT_FLOAT)
+		return;
+	audio_monitor->format = format;
+	if (audio_monitor->resampler) {
+		audio_monitor_stop(audio_monitor);
+		audio_monitor_start(audio_monitor);
+	}
+}
+
+void audio_monitor_set_samples_per_sec(struct audio_monitor *audio_monitor,
+				       long long samples_per_sec)
+{
+	if (samples_per_sec <= 0 ||
+	    audio_monitor->samples_per_sec == samples_per_sec)
+		return;
+	audio_monitor->samples_per_sec = samples_per_sec;
+	if (audio_monitor->resampler) {
+		audio_monitor_stop(audio_monitor);
+		audio_monitor_start(audio_monitor);
+	}
 }
